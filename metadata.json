@@ -1,0 +1,6 @@
+{
+  "name": "Backrooms Procedural Generator",
+  "description": "An infinite procedurally generated Backrooms simulator optimizing PS2/PS4-style memory limits. It showcases chunk-level collision logic, wall/hallway/room classification, random column placements, and a live 3D raycaster and 2D map viewer.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

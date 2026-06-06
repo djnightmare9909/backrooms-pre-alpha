@@ -1,0 +1,38 @@
+@import "tailwindcss";
+
+@keyframes scaleUpBackpack {
+  0% { transform: scale(0.2) rotate(15deg); opacity: 0; }
+  100% { transform: scale(2.2) rotate(0deg); opacity: 1; }
+}
+
+@keyframes floatBackpack {
+  0%, 100% { transform: translateY(0px) scale(2.2); }
+  50% { transform: translateY(-10px) scale(2.2); }
+}
+
+@keyframes emergeBook {
+  0% { transform: translateY(120px) scale(0.3) rotate(-30deg); opacity: 0; }
+  100% { transform: translateY(-30px) scale(2) rotate(0deg); opacity: 1; }
+}
+
+@keyframes bookOpenFlip {
+  0% { transform: scale(1) rotateY(90deg); opacity: 0.5; }
+  50% { transform: scale(1.6) rotateY(45deg); }
+  100% { transform: scale(2.2) rotateY(0deg); opacity: 1; }
+}
+
+.animate-scale-up-backpack {
+  animation: scaleUpBackpack 0.8s cubic-bezier(0.18, 0.89, 0.32, 1.28) forwards;
+}
+
+.animate-floating {
+  animation: floatBackpack 1.8s ease-in-out infinite;
+}
+
+.animate-emerge-book {
+  animation: emergeBook 0.9s cubic-bezier(0.25, 1, 0.5, 1) forwards;
+}
+
+.animate-book-open-flip {
+  animation: bookOpenFlip 1.0s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
