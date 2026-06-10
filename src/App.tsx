@@ -228,6 +228,10 @@ export function getBaseTileClassification(globalTileCoordinateX: number, globalT
   return { type: "outside", solid: true };
 }
 
+// Spatial tile memoization across frames for infinite static sector grids
+const GLOB_TILE_CACHE = new Map<string, TileClassification>();
+let GLOB_TILE_CACHE_SEED = -1;
+
 export function getTileClassification(
   globalTileCoordinateX: number,
   globalTileCoordinateY: number, // (preserved for matching other variables)
@@ -235,7 +239,19 @@ export function getTileClassification(
   collectedCount?: number,
   spawnedCount?: number
 ): TileClassification {
+  if (globalWorldSeed !== GLOB_TILE_CACHE_SEED) {
+    GLOB_TILE_CACHE.clear();
+    GLOB_TILE_CACHE_SEED = globalWorldSeed;
+  }
+  
+  const key = `${globalTileCoordinateX},${globalTileCoordinateY}`;
+  const cachedVal = GLOB_TILE_CACHE.get(key);
+  if (cachedVal !== undefined) {
+    return cachedVal;
+  }
+
   const baseResult = getBaseTileClassification(globalTileCoordinateX, globalTileCoordinateY, globalWorldSeed);
+  let computedResult = baseResult;
   
   if (baseResult.solid) {
     // 🎲 Deterministic spatial hash across infinite wall coordinates
@@ -247,13 +263,13 @@ export function getTileClassification(
     if (isAnomalousPotential) {
       // "If the d20 lands 15 to 20 a wall becomes an anomaly."
       const d20Roll = (Math.floor(wallTileHash / 300) % 20) + 1;
-      const isImportOsAnomaly = d20Roll >= 15; // Lands 15, 16, 17, 18, 19, or 20 (30% chance / 6 out of 20)
+      const isImportOsAnomaly = d20Roll >= 15; // Lands 15-20 (30% chance)
       
       if (isImportOsAnomaly) {
         // "where one in three anomalies is the real exit"
         const isRealExit = (Math.floor(wallTileHash / 6000) % 3) === 0; // 1-in-3 deterministic fraction
         
-        return {
+        computedResult = {
           type: baseResult.type,
           solid: !isRealExit, // Walkable only if it's a real exit!
           isImportOs: true,
@@ -263,7 +279,8 @@ export function getTileClassification(
     }
   }
   
-  return baseResult;
+  GLOB_TILE_CACHE.set(key, computedResult);
+  return computedResult;
 }
 
 // Check collision bubble overlap between player bounding sphere and solid environment block coordinates
@@ -298,6 +315,59 @@ function checkCollision(
     }
   }
   return false;
+}
+
+// Resolves character circle overlap against surrounding solid tile walls, providing silky-smooth slide response
+function resolveCollisions(targetX: number, targetZ: number, radius: number, seed: number): { x: number; z: number } {
+  let resolvedX = targetX;
+  let resolvedZ = targetZ;
+
+  const tileMinX = Math.floor(resolvedX - radius - 1);
+  const tileMaxX = Math.floor(resolvedX + radius + 1);
+  const tileMinZ = Math.floor(resolvedZ - radius - 1);
+  const tileMaxZ = Math.floor(resolvedZ + radius + 1);
+
+  // Run up to 3 resolution iterations to solve multi-wall or corner friction nicely
+  for (let iteration = 0; iteration < 3; iteration++) {
+    let collided = false;
+    for (let tx = tileMinX; tx <= tileMaxX; tx++) {
+      for (let tz = tileMinZ; tz <= tileMaxZ; tz++) {
+        const tile = getTileClassification(tx, tz, seed);
+        if (tile.solid) {
+          // Find closest coordinate point on the 1x1 solid tile bounding box to the player's circle center
+          const closestX = Math.max(tx, Math.min(resolvedX, tx + 1));
+          const closestZ = Math.max(tz, Math.min(resolvedZ, tz + 1));
+
+          const diffX = resolvedX - closestX;
+          const diffZ = resolvedZ - closestZ;
+          const dist = Math.sqrt(diffX * diffX + diffZ * diffZ);
+
+          const bufferMargin = radius + 0.001; // tiny epsilon padding to guarantee separation
+          if (dist < bufferMargin && dist > 0) {
+            const pushX = (diffX / dist) * (bufferMargin - dist);
+            const pushZ = (diffZ / dist) * (bufferMargin - dist);
+            resolvedX += pushX;
+            resolvedZ += pushZ;
+            collided = true;
+          } else if (dist === 0) {
+            // Exact center overlap; nudge slightly based on physical tile midpoint displacement
+            const centerX = tx + 0.5;
+            const centerZ = tz + 0.5;
+            const pushDirX = resolvedX - centerX || 1;
+            const pushDirZ = resolvedZ - centerZ || 1;
+            if (Math.abs(pushDirX) > Math.abs(pushDirZ)) {
+              resolvedX += Math.sign(pushDirX) * 0.1;
+            } else {
+              resolvedZ += Math.sign(pushDirZ) * 0.1;
+            }
+            collided = true;
+          }
+        }
+      }
+    }
+    if (!collided) break; // Finished early if all overlapping walls resolved
+  }
+  return { x: resolvedX, z: resolvedZ };
 }
 
 // Hardcoded copy-paste contents for target python project explorer
@@ -775,6 +845,25 @@ function generateJournalEntry(randomizer: SeededRandomNumberGenerator): string {
   return entry.join("\n\n");
 }
 
+export interface ChalkItem {
+  id: string;
+  name: string;
+  uses: number;
+  maxUses: number;
+  type: "chalk";
+}
+
+export type InventoryItem = ChalkItem;
+
+export interface ChalkDrawing {
+  id: string;
+  tileX: number;
+  tileZ: number;
+  face: "north" | "south" | "east" | "west";
+  symbol: "left-arrow" | "right-arrow" | "triangle" | "star" | "tree";
+  u: number;
+}
+
 export interface BackpackItem {
   sx: number;
   sz: number;
@@ -783,6 +872,7 @@ export interface BackpackItem {
   item: string;
   pages: number;
   latest_entry: string;
+  contents?: InventoryItem[];
 }
 
 export function getBackpackInSector(sectorX: number, sectorZ: number, globalWorldSeed: number): BackpackItem | null {
@@ -817,7 +907,16 @@ export function getBackpackInSector(sectorX: number, sectorZ: number, globalWorl
     gz: globalPacksZ,
     item: "canvas backpack",
     pages: totalPagesCount,
-    latest_entry: generatedDiaryText
+    latest_entry: generatedDiaryText,
+    contents: [
+      {
+        id: `chalk-${sectorX}-${sectorZ}-${globalWorldSeed}`,
+        name: "Red Chalk",
+        uses: 25,
+        maxUses: 25,
+        type: "chalk"
+      }
+    ]
   };
 }
 
@@ -941,7 +1040,57 @@ export default function App() {
   };
 
   const [isPointerLocked, setIsPointerLocked] = useState<boolean>(false);
+  const [showCooldownWarning, setShowCooldownWarning] = useState<boolean>(false);
+  const lastPtrExitTimeRef = useRef<number>(0);
   const mousePosRef = useRef<{ x: number; y: number } | null>(null);
+
+  // 🎒 Player Inventory Configuration & Chalk drawings state maps
+  const [isInventoryOpen, setIsInventoryOpen] = useState<boolean>(false);
+  const [isInventoryUnlocked, setIsInventoryUnlocked] = useState<boolean>(false);
+
+  const [inventorySlots, setInventorySlotsReal] = useState<(InventoryItem | null)[]>(() => [null, null, null, null, null]);
+  const inventorySlotsRef = useRef<(InventoryItem | null)[]>([]);
+  const setInventorySlots = (val: (InventoryItem | null)[] | ((prev: (InventoryItem | null)[]) => (InventoryItem | null)[])) => {
+    if (typeof val === "function") {
+      setInventorySlotsReal((prev) => {
+        const next = val(prev);
+        inventorySlotsRef.current = next;
+        return next;
+      });
+    } else {
+      setInventorySlotsReal(val);
+      inventorySlotsRef.current = val;
+    }
+  };
+
+  const [selectedInventoryIndex, setSelectedInventoryIndexReal] = useState<number | null>(null);
+  const selectedInventoryIndexRef = useRef<number | null>(null);
+  const setSelectedInventoryIndex = (val: number | null) => {
+    setSelectedInventoryIndexReal(val);
+    selectedInventoryIndexRef.current = val;
+  };
+
+  const [selectedChalkSymbol, setSelectedChalkSymbolReal] = useState<"left-arrow" | "right-arrow" | "triangle" | "star" | "tree">("left-arrow");
+  const selectedChalkSymbolRef = useRef<"left-arrow" | "right-arrow" | "triangle" | "star" | "tree">("left-arrow");
+  const setSelectedChalkSymbol = (val: "left-arrow" | "right-arrow" | "triangle" | "star" | "tree") => {
+    setSelectedChalkSymbolReal(val);
+    selectedChalkSymbolRef.current = val;
+  };
+
+  const [chalkDrawings, setChalkDrawingsReal] = useState<ChalkDrawing[]>([]);
+  const chalkDrawingsRef = useRef<ChalkDrawing[]>([]);
+  const setChalkDrawings = (val: ChalkDrawing[] | ((prev: ChalkDrawing[]) => ChalkDrawing[])) => {
+    if (typeof val === "function") {
+      setChalkDrawingsReal((prev) => {
+        const next = val(prev);
+        chalkDrawingsRef.current = next;
+        return next;
+      });
+    } else {
+      setChalkDrawingsReal(val);
+      chalkDrawingsRef.current = val;
+    }
+  };
   const hoveredBackpackRef = useRef<BackpackItem | null>(null);
 
   // Widget function to spawn test backpack 2 tiles/feet in front of player
@@ -965,6 +1114,15 @@ export default function App() {
       item: "canvas backpack",
       pages,
       latest_entry,
+      contents: [
+        {
+          id: `chalk-${Math.floor(spawnX)}-${Math.floor(spawnZ)}-${Date.now()}`,
+          name: "Red Chalk",
+          uses: 25,
+          maxUses: 25,
+          type: "chalk"
+        }
+      ]
     };
     
     setSpawnedBackpacksState([...spawnedBackpacks, b]);
@@ -1008,12 +1166,38 @@ export default function App() {
   };
 
   const collectBackpack = (bpack: BackpackItem) => {
+    playPickupSound();
     const updated = [...collectedBackpacks, bpack];
     setCollectedBackpacks(updated);
     collectedBackpacksRef.current = updated;
     if (!selectedJournal) {
       setSelectedJournal(bpack);
     }
+
+    // Unlock inventory on collecting a backpack
+    setIsInventoryUnlocked(true);
+
+    // Stash backpack items in player's slots (up to 5 general slots)
+    setInventorySlots((prevSlots) => {
+      const nextSlots = [...prevSlots];
+      const itemsToAdd = bpack.contents || [
+        {
+          id: `chalk-fallback-${Date.now()}-${Math.random()}`,
+          name: "Red Chalk",
+          uses: 25,
+          maxUses: 25,
+          type: "chalk"
+        }
+      ];
+
+      itemsToAdd.forEach((itemToAdd) => {
+        const firstEmptyIndex = nextSlots.findIndex((s) => s === null);
+        if (firstEmptyIndex !== -1) {
+          nextSlots[firstEmptyIndex] = { ...itemToAdd };
+        }
+      });
+      return nextSlots;
+    });
   };
   
   // Real-time variables for UI binding
@@ -1043,9 +1227,180 @@ export default function App() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const humOscRef = useRef<OscillatorNode | null>(null);
   const humGainRef = useRef<GainNode | null>(null);
+  const stepTimerRef = useRef<number>(0);
+
+  // Lazy-initialize Web Audio Context on first user reaction
+  const getAudioContext = (): AudioContext | null => {
+    try {
+      if (!audioCtxRef.current) {
+        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        audioCtxRef.current = new AudioContextClass();
+      }
+      if (audioCtxRef.current.state === "suspended") {
+        audioCtxRef.current.resume();
+      }
+      return audioCtxRef.current;
+    } catch (e) {
+      console.error("Audio Context creation failed:", e);
+      return null;
+    }
+  };
+
+  // Synthesizes a dusty, muffled wet rubber step thud landing on soggy Level-0 carpet
+  const playFootstepSound = () => {
+    const ctx = getAudioContext();
+    if (!ctx || ctx.state === "suspended") return;
+
+    try {
+      const osc = ctx.createOscillator();
+      const filter = ctx.createBiquadFilter();
+      const gain = ctx.createGain();
+
+      osc.type = "triangle";
+      osc.frequency.setValueAtTime(42, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(12, ctx.currentTime + 0.14);
+
+      filter.type = "lowpass";
+      filter.frequency.setValueAtTime(140, ctx.currentTime);
+
+      gain.gain.setValueAtTime(0.18, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.005, ctx.currentTime + 0.14);
+
+      osc.connect(filter);
+      filter.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc.start();
+      osc.stop(ctx.currentTime + 0.15);
+    } catch (e) {
+      console.warn("Footstep sound error:", e);
+    }
+  };
+
+  // Synthesizes a beautiful dual-chord digital handheld memory lock confirmation chime
+  const playPickupSound = () => {
+    const ctx = getAudioContext();
+    if (!ctx || ctx.state === "suspended") return;
+
+    try {
+      const osc1 = ctx.createOscillator();
+      const osc2 = ctx.createOscillator();
+      const gain1 = ctx.createGain();
+      const gain2 = ctx.createGain();
+
+      osc1.type = "sine";
+      osc1.frequency.setValueAtTime(330, ctx.currentTime);
+      osc1.frequency.setValueAtTime(495, ctx.currentTime + 0.08);
+
+      osc2.type = "sine";
+      osc2.frequency.setValueAtTime(660, ctx.currentTime);
+      osc2.frequency.setValueAtTime(990, ctx.currentTime + 0.08);
+
+      gain1.gain.setValueAtTime(0.08, ctx.currentTime);
+      gain1.gain.exponentialRampToValueAtTime(0.005, ctx.currentTime + 0.22);
+      
+      gain2.gain.setValueAtTime(0.04, ctx.currentTime);
+      gain2.gain.exponentialRampToValueAtTime(0.005, ctx.currentTime + 0.22);
+
+      osc1.connect(gain1);
+      gain1.connect(ctx.destination);
+
+      osc2.connect(gain2);
+      gain2.connect(ctx.destination);
+
+      osc1.start();
+      osc2.start();
+      osc1.stop(ctx.currentTime + 0.25);
+      osc2.stop(ctx.currentTime + 0.25);
+    } catch (e) {
+      console.warn("Pickup sound error:", e);
+    }
+  };
+
+  // Synthesizes a jaw-dropping interdimensional FM-modulating sweep glitch/noclip warp sound
+  const playExitGlitchSound = () => {
+    const ctx = getAudioContext();
+    if (!ctx || ctx.state === "suspended") return;
+
+    try {
+      const osc = ctx.createOscillator();
+      const oscMod = ctx.createOscillator();
+      const modGain = ctx.createGain();
+      const filter = ctx.createBiquadFilter();
+      const mainGain = ctx.createGain();
+
+      osc.type = "sawtooth";
+      osc.frequency.setValueAtTime(90, ctx.currentTime);
+      osc.frequency.linearRampToValueAtTime(750, ctx.currentTime + 0.38);
+      osc.frequency.exponentialRampToValueAtTime(45, ctx.currentTime + 0.78);
+
+      oscMod.type = "sine";
+      oscMod.frequency.setValueAtTime(110, ctx.currentTime);
+      modGain.gain.setValueAtTime(110, ctx.currentTime);
+
+      filter.type = "bandpass";
+      filter.frequency.setValueAtTime(450, ctx.currentTime);
+      filter.frequency.linearRampToValueAtTime(1800, ctx.currentTime + 0.38);
+      filter.frequency.exponentialRampToValueAtTime(90, ctx.currentTime + 0.78);
+
+      mainGain.gain.setValueAtTime(0.15, ctx.currentTime);
+      mainGain.gain.linearRampToValueAtTime(0.22, ctx.currentTime + 0.18);
+      mainGain.gain.exponentialRampToValueAtTime(0.002, ctx.currentTime + 0.82);
+
+      oscMod.connect(modGain);
+      modGain.connect(osc.frequency); // FM-modulation glitch vibrato
+
+      osc.connect(filter);
+      filter.connect(mainGain);
+      mainGain.connect(ctx.destination);
+
+      osc.start();
+      oscMod.start();
+      osc.stop(ctx.currentTime + 0.85);
+      oscMod.stop(ctx.currentTime + 0.85);
+    } catch (e) {
+      console.warn("Exit glitch sound error:", e);
+    }
+  };
+
+  // Continuous touch hold gamepad trackers for flawless mobile joystick navigation
+  const handleTouchStartStr = (direction: string) => {
+    getAudioContext(); // Lazy-resume audio on mobile when they start interacting with the D-pad
+
+    if (direction === "forward") {
+      keysPressedRef.current["w"] = true;
+      keysPressedRef.current["arrowup"] = true;
+    } else if (direction === "backward") {
+      keysPressedRef.current["s"] = true;
+      keysPressedRef.current["arrowdown"] = true;
+    } else if (direction === "left") {
+      keysPressedRef.current["a"] = true;
+      keysPressedRef.current["arrowleft"] = true;
+    } else if (direction === "right") {
+      keysPressedRef.current["d"] = true;
+      keysPressedRef.current["arrowright"] = true;
+    }
+  };
+
+  const handleTouchEndStr = (direction: string) => {
+    if (direction === "forward") {
+      keysPressedRef.current["w"] = false;
+      keysPressedRef.current["arrowup"] = false;
+    } else if (direction === "backward") {
+      keysPressedRef.current["s"] = false;
+      keysPressedRef.current["arrowdown"] = false;
+    } else if (direction === "left") {
+      keysPressedRef.current["a"] = false;
+      keysPressedRef.current["arrowleft"] = false;
+    } else if (direction === "right") {
+      keysPressedRef.current["d"] = false;
+      keysPressedRef.current["arrowright"] = false;
+    }
+  };
 
   // Handle keypad clicks
   const handleKeyPad = (dir: string) => {
+    getAudioContext();
     const angle = playerAngleRef.current;
     let dx = 0;
     let dz = 0;
@@ -1071,12 +1426,13 @@ export default function App() {
       const proposed_dz = ndz * 1.5;
 
       const next_x = playerXRef.current + proposed_dx;
-      if (!checkCollision(next_x, playerZRef.current, radius, seed)) {
-        playerXRef.current = next_x;
-      }
       const next_z = playerZRef.current + proposed_dz;
-      if (!checkCollision(playerXRef.current, next_z, radius, seed)) {
-        playerZRef.current = next_z;
+      const resolved = resolveCollisions(next_x, next_z, radius, seed);
+      playerXRef.current = resolved.x;
+      playerZRef.current = resolved.z;
+
+      if (isHumming) {
+        playFootstepSound();
       }
     }
   };
@@ -1085,9 +1441,8 @@ export default function App() {
   useEffect(() => {
     if (isHumming) {
       try {
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-        const ctx = new AudioContextClass();
-        audioCtxRef.current = ctx;
+        const ctx = getAudioContext();
+        if (!ctx) return;
 
         // Base 60Hz hum oscillator (replicating alternating current leakage in old building fixtures)
         const osc = ctx.createOscillator();
@@ -1118,18 +1473,12 @@ export default function App() {
         try { humOscRef.current.stop(); } catch (e) {}
         humOscRef.current = null;
       }
-      if (audioCtxRef.current) {
-        try { audioCtxRef.current.close(); } catch (e) {}
-        audioCtxRef.current = null;
-      }
     }
 
     return () => {
       if (humOscRef.current) {
         try { humOscRef.current.stop(); } catch (e) {}
-      }
-      if (audioCtxRef.current) {
-        try { audioCtxRef.current.close(); } catch (e) {}
+        humOscRef.current = null;
       }
     };
   }, [isHumming]);
@@ -1148,6 +1497,21 @@ export default function App() {
       if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key)) {
         e.preventDefault();
       }
+      
+      if (e.key.toLowerCase() === "i") {
+        e.preventDefault();
+        setIsInventoryOpen((prev) => {
+          const next = !prev;
+          if (next) {
+            if (document.pointerLockElement === canvasRef.current) {
+              document.exitPointerLock();
+            }
+          }
+          return next;
+        });
+        return;
+      }
+      
       keysPressedRef.current[e.key.toLowerCase()] = true;
     };
 
@@ -1158,6 +1522,13 @@ export default function App() {
     const handleLockChange = () => {
       const isLocked = document.pointerLockElement === canvasRef.current;
       setIsPointerLocked(isLocked);
+      if (!isLocked) {
+        lastPtrExitTimeRef.current = Date.now();
+      }
+    };
+
+    const handleLockError = (e: Event) => {
+      console.warn("Pointer lock error caught (usually refractory period or user cancellation):", e);
     };
 
     const handleMouseMoveGaze = (e: MouseEvent) => {
@@ -1175,12 +1546,14 @@ export default function App() {
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("keyup", handleKeyUp);
     document.addEventListener("pointerlockchange", handleLockChange);
+    document.addEventListener("pointerlockerror", handleLockError);
     window.addEventListener("mousemove", handleMouseMoveGaze);
 
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
       document.removeEventListener("pointerlockchange", handleLockChange);
+      document.removeEventListener("pointerlockerror", handleLockError);
       window.removeEventListener("mousemove", handleMouseMoveGaze);
     };
   }, [viewMode]);
@@ -1283,20 +1656,25 @@ export default function App() {
         const proposedMovementDistanceDeltaX = normalizedMovementDeltaX * configuredMovementSpeedScalar * deltaTimeScaleInSeconds;
         const proposedMovementDistanceDeltaZ = normalizedMovementDeltaZ * configuredMovementSpeedScalar * deltaTimeScaleInSeconds;
 
-        const collectedQty = collectedBackpacksRef.current.length;
-        const spawnedQty = spawnedBackpacksRef.current.length;
-
-        // Slide check on X coordinate
         const provisionalPlayerPositionX = playerXRef.current + proposedMovementDistanceDeltaX;
-        if (!checkCollision(provisionalPlayerPositionX, playerZRef.current, playerBoundingRadiusFeet, seed, collectedQty, spawnedQty)) {
-          playerXRef.current = provisionalPlayerPositionX;
-        }
-
-        // Slide check on Z coordinate
         const provisionalPlayerPositionZ = playerZRef.current + proposedMovementDistanceDeltaZ;
-        if (!checkCollision(playerXRef.current, provisionalPlayerPositionZ, playerBoundingRadiusFeet, seed, collectedQty, spawnedQty)) {
-          playerZRef.current = provisionalPlayerPositionZ;
+
+        // Perform silky-smooth sliding collision resolution
+        const resolved = resolveCollisions(provisionalPlayerPositionX, provisionalPlayerPositionZ, playerBoundingRadiusFeet, seed);
+        playerXRef.current = resolved.x;
+        playerZRef.current = resolved.z;
+
+        // Sound footsteps timing feedback (step thuds sound every 0.38 seconds while running)
+        if (isHumming) {
+          stepTimerRef.current += deltaTimeScaleInSeconds;
+          if (stepTimerRef.current >= 0.38) {
+            playFootstepSound();
+            stepTimerRef.current = 0;
+          }
         }
+      } else {
+        // Reset step timer when standing still so next move triggers quick sensory step
+        stepTimerRef.current = 0;
       }
 
       // 🎒 PROXIMITY AND INTERACTION DETECT LOOP (No longer stashes auto, requires manual hover & click)
@@ -1320,7 +1698,12 @@ export default function App() {
 
       // Check if player noclipped or entered the exit tile
       if (classification.isExit) {
-        setHasEscaped(true);
+        setHasEscaped((prev) => {
+          if (!prev) {
+            playExitGlitchSound();
+          }
+          return true;
+        });
       }
       
       // Calculate fake PS2 heap loaded chunks based on loading distance radius of 3 (7x7 chunks = 49)
@@ -1670,12 +2053,160 @@ export default function App() {
           const startY = (height - wallHeight) / 2;
           ctx.fillRect(targetDrawColX, startY, rWidth + 0.1, wallHeight);
 
+          // Render a pulsing cyberpunk digital code leak scanner effect directly over anomaly partition slices
+          if (isRayOsAnomaly) {
+            const scanPulse = Math.sin(Date.now() / 240 + targetDrawColX / 20);
+            if (isRayOsExit) {
+              // Real exit: Leaks bright, glowing neon-green code matrix bytes
+              ctx.fillStyle = `rgba(16, 185, 129, ${(0.28 + 0.14 * scanPulse) * visibility})`;
+            } else {
+              // Fake anomaly: Leaks slow flickering cybernetic dark cyan bytes
+              ctx.fillStyle = `rgba(6, 182, 212, ${(0.22 + 0.1 * Math.sin(Date.now() / 140)) * visibility})`;
+            }
+            ctx.fillRect(targetDrawColX, startY, rWidth + 0.1, wallHeight);
+          }
+
           // Draw a faint black wallpaper border pattern line aligned around mid-height (Level-0 trim line)
           if (correctedDist < 20) {
             ctx.fillStyle = `rgba(30, 25, 10, ${0.4 * visibility})`;
             // EXPLANATORY COMMENT: For "import os" anomalies, we mirror the elevation of the wall details vertically (0.25 scaling near the ceiling grid instead of 0.75 near the carpet) to reinforce the reverse orientation!
             const verticalTrimOffsetRatio = isRayOsAnomaly ? 0.25 : 0.75;
             ctx.fillRect(targetDrawColX, startY + wallHeight * verticalTrimOffsetRatio, rWidth + 0.1, Math.max(1, wallHeight * 0.04));
+          }
+
+          // 🖍️ PERSPECTIVE CHALK DRAWINGS OVERLAY
+          const hX = Math.floor(rx);
+          const hZ = Math.floor(rz);
+          const cellFracX = rx - hX;
+          const cellFracZ = rz - hZ;
+          const dL = cellFracX;
+          const dR = 1 - cellFracX;
+          const dT = cellFracZ;
+          const dB = 1 - cellFracZ;
+          const minE = Math.min(dL, dR, dT, dB);
+          
+          let faceHit: "north" | "south" | "east" | "west" = "north";
+          let uVal = 0.5;
+
+          if (minE === dL) {
+            faceHit = "west";
+            uVal = cellFracZ;
+          } else if (minE === dR) {
+            faceHit = "east";
+            uVal = 1 - cellFracZ;
+          } else if (minE === dT) {
+            faceHit = "north";
+            uVal = 1 - cellFracX;
+          } else {
+            faceHit = "south";
+            uVal = cellFracX;
+          }
+
+          const activeDrawings = chalkDrawingsRef.current.filter(
+            (d) => d.tileX === hX && d.tileZ === hZ && d.face === faceHit
+          );
+
+          if (activeDrawings.length > 0) {
+            const decalWidth = 0.22;
+            activeDrawings.forEach((drawing) => {
+              const uDrawing = drawing.u;
+              const uMin = uDrawing - decalWidth / 2;
+              const uMax = uDrawing + decalWidth / 2;
+              if (uVal >= uMin && uVal <= uMax) {
+                const localU = (uVal - uMin) / (uMax - uMin);
+                let renderSymbol = false;
+                let symMin = 0.0;
+                let symMax = 0.0;
+
+                switch (drawing.symbol) {
+                  case "triangle": {
+                    symMin = Math.abs(localU - 0.5) * 2;
+                    symMax = 0.85;
+                    renderSymbol = symMin < symMax;
+                    break;
+                  }
+                  case "left-arrow": {
+                    if (localU >= 0.3) {
+                      symMin = 0.44;
+                      symMax = 0.56;
+                      renderSymbol = true;
+                    }
+                    if (localU < 0.4) {
+                      const h = localU * 1.25;
+                      symMin = Math.min(symMin !== 0 ? symMin : 1, 0.5 - h);
+                      symMax = Math.max(symMax, 0.5 + h);
+                      renderSymbol = true;
+                    }
+                    break;
+                  }
+                  case "right-arrow": {
+                    if (localU <= 0.7) {
+                      symMin = 0.44;
+                      symMax = 0.56;
+                      renderSymbol = true;
+                    }
+                    if (localU > 0.6) {
+                      const h = (1.0 - localU) * 1.25;
+                      symMin = Math.min(symMin !== 0 ? symMin : 1, 0.5 - h);
+                      symMax = Math.max(symMax, 0.5 + h);
+                      renderSymbol = true;
+                    }
+                    break;
+                  }
+                  case "star": {
+                    const starWave = Math.sin(localU * Math.PI * 3);
+                    symMin = 0.3 + 0.2 * Math.abs(starWave);
+                    symMax = 0.7 - 0.2 * Math.abs(starWave);
+                    renderSymbol = symMin < symMax;
+                    break;
+                  }
+                  case "tree": {
+                    let treeMin = 1.0, treeMax = 0.0;
+                    let active = false;
+                    if (localU >= 0.44 && localU <= 0.56) {
+                      treeMin = 0.7;
+                      treeMax = 0.95;
+                      active = true;
+                    }
+                    if (localU >= 0.15 && localU <= 0.85) {
+                      const currentMin = 0.45 + (Math.abs(localU - 0.5) / 0.35) * 0.25;
+                      if (currentMin < 0.7) {
+                        treeMin = Math.min(treeMin, currentMin);
+                        treeMax = Math.max(treeMax, 0.7);
+                        active = true;
+                      }
+                    }
+                    if (localU >= 0.25 && localU <= 0.75) {
+                      const currentMin = 0.15 + (Math.abs(localU - 0.5) / 0.25) * 0.3;
+                      if (currentMin < 0.45) {
+                        treeMin = Math.min(treeMin, currentMin);
+                        treeMax = Math.max(treeMax, 0.45);
+                        active = true;
+                      }
+                    }
+                    if (active) {
+                      symMin = treeMin;
+                      symMax = treeMax;
+                      renderSymbol = true;
+                    }
+                    break;
+                  }
+                }
+
+                if (renderSymbol) {
+                  const redValue = Math.floor(239 * visibility);
+                  const greenValue = Math.floor(30 * visibility);
+                  const blueValue = Math.floor(30 * visibility);
+                  ctx.fillStyle = `rgb(${redValue}, ${greenValue}, ${blueValue})`;
+
+                  const boxHeight = wallHeight * 0.4;
+                  const boxTop = startY + wallHeight * 0.3;
+                  const segTop = boxTop + symMin * boxHeight;
+                  const segBottom = boxTop + symMax * boxHeight;
+                  ctx.fillRect(targetDrawColX, segTop, rWidth + 0.1, Math.max(1, segBottom - segTop));
+                }
+              }
+            });
           }
         }
       }
@@ -1947,15 +2478,362 @@ export default function App() {
 
             {/* Interactive Canvas */}
             <div className="relative bg-[#060606] flex items-center justify-center p-2 xl:p-4 aspect-video" id="canvas-container">
+              {showCooldownWarning && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/80 font-mono text-center px-4 animate-fade-in z-20" id="cooldown-warn-modal">
+                  <div className="border border-yellow-600/30 bg-[#121211] p-4 rounded-xl max-w-xs space-y-2 text-[#eaeae0] shadow-2xl">
+                    <p className="text-yellow-500 font-bold text-xs uppercase tracking-wide">⚠ SYSTEM COOLDOWN</p>
+                    <p className="text-[11px] text-[#abab9e] leading-relaxed">
+                      Pointer lock recently exited. Browser safety cooldown active. Please wait a second before re-locking mouse look.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* 🎒 DIEGETIC INVENTORY OVERLAY PANEL */}
+              {isInventoryOpen && (
+                <div 
+                  id="inventory-overlay" 
+                  className="absolute left-2 right-2 top-2 bottom-2 md:left-4 md:right-auto md:top-4 md:bottom-4 w-auto md:w-80 bg-[#111110]/95 backdrop-blur-md border border-[#3e3e37] rounded-xl flex flex-col p-3 md:p-4 shadow-2xl z-20 font-mono text-xs text-[#eaeae0] overflow-y-auto animate-fade-in"
+                >
+                  {/* Header */}
+                  <div className="flex justify-between items-center border-b border-[#2e2e2a] pb-2 mb-3">
+                    <div className="flex items-center gap-1.5 text-[#fbbf24] font-bold uppercase tracking-wider text-[11px]">
+                      <span className="animate-pulse">🎒</span>
+                      <span>EQUIPMENT & GEAR</span>
+                    </div>
+                    <button 
+                      onClick={() => {
+                        setIsInventoryOpen(false);
+                        // If center look-mode is selected, grab pointer lock back
+                        if (viewMode === "3D") {
+                          try {
+                            canvasRef.current?.requestPointerLock();
+                          } catch (err) {}
+                        }
+                      }}
+                      className="text-[#99998e] hover:text-[#ffffff] bg-[#222220] hover:bg-red-950/40 p-1 px-2 rounded border border-[#333330] transition-colors"
+                    >
+                      ✕ CLOSE
+                    </button>
+                  </div>
+
+                  {/* 1. Humanoid Body Map (L. Hand, R. Hand, L. Hip, R. Hip) */}
+                  <div className="relative w-full h-36 bg-[#0b0b0a] border border-[#2e2e2a] rounded-lg flex items-center justify-center overflow-hidden mb-3">
+                    {/* Abstract humanoid representation */}
+                    <div className="relative w-24 h-full flex flex-col items-center justify-center opacity-30 select-none pointer-events-none scale-90">
+                      {/* Head */}
+                      <div className="w-5 h-5 rounded-full bg-stone-500 mb-1" />
+                      {/* Torso */}
+                      <div className="w-8 h-12 bg-stone-500 rounded relative">
+                        {/* Arms */}
+                        <div className="absolute -left-4 top-0 w-3 h-10 bg-stone-500 rounded origin-top -rotate-12" />
+                        <div className="absolute -right-4 top-0 w-3 h-10 bg-stone-500 rounded origin-top rotate-12" />
+                      </div>
+                      {/* Hips & Legs */}
+                      <div className="w-8 h-2 bg-stone-500 rounded-sm mb-1 mt-0.5" />
+                      <div className="flex gap-2 w-10 h-8 justify-between">
+                        <div className="w-3.5 h-full bg-stone-500 rounded-b" />
+                        <div className="w-3.5 h-full bg-stone-500 rounded-b" />
+                      </div>
+                    </div>
+
+                    {/* Equipment slots absolute overlays */}
+                    {/* Left Hand Slot */}
+                    <div className="absolute left-2.5 top-2 flex flex-col items-center text-center">
+                      <span className="text-[7.5px] text-[#99998f] font-mono scale-90 mb-0.5 font-bold uppercase tracking-wide">Left Hand</span>
+                      <div className="w-11 h-12 border border-dashed border-[#55554e] bg-[#141413] rounded flex flex-col items-center justify-center text-[8px] text-stone-600 font-bold select-none cursor-not-allowed">
+                        <span>L_PAD</span>
+                        <span className="text-[6.5px] text-stone-700 font-mono tracking-widest mt-0.5">EMPTY</span>
+                      </div>
+                    </div>
+
+                    {/* Right Hand Slot */}
+                    <div className="absolute right-2.5 top-2 flex flex-col items-center text-center">
+                      <span className="text-[7.5px] text-[#99998f] font-mono scale-90 mb-0.5 font-bold uppercase tracking-wide">Right Hand</span>
+                      <div className="w-11 h-12 border border-dashed border-[#55554e] bg-[#141413] rounded flex flex-col items-center justify-center text-[8px] text-stone-600 font-bold select-none cursor-not-allowed">
+                        <span>R_PAD</span>
+                        <span className="text-[6.5px] text-stone-700 font-mono tracking-widest mt-0.5">EMPTY</span>
+                      </div>
+                    </div>
+
+                    {/* Left Hip Slot */}
+                    <div className="absolute left-2.5 bottom-2 flex flex-col items-center text-center">
+                      <div className="w-11 h-12 border border-dashed border-[#55554e] bg-[#141413] rounded flex flex-col items-center justify-center text-[8px] text-stone-600 font-bold select-none cursor-not-allowed">
+                        <span>L_HIP</span>
+                        <span className="text-[6.5px] text-stone-700 font-mono tracking-widest mt-0.5">EMPTY</span>
+                      </div>
+                      <span className="text-[7.5px] text-[#99998f] font-mono scale-90 mt-0.5 font-bold uppercase tracking-wide">Left Hip</span>
+                    </div>
+
+                    {/* Right Hip Slot */}
+                    <div className="absolute right-2.5 bottom-2 flex flex-col items-center text-center">
+                      <div className="w-11 h-12 border border-dashed border-[#55554e] bg-[#141413] rounded flex flex-col items-center justify-center text-[8px] text-stone-600 font-bold select-none cursor-not-allowed">
+                        <span>R_HIP</span>
+                        <span className="text-[6.5px] text-stone-700 font-mono tracking-widest mt-0.5">EMPTY</span>
+                      </div>
+                      <span className="text-[7.5px] text-[#99998f] font-mono scale-90 mt-0.5 font-bold uppercase tracking-wide">Right Hip</span>
+                    </div>
+                  </div>
+
+                  {/* 2. 5 Storage Slots (General Inventory) */}
+                  <div className="space-y-1.5 mb-3">
+                    <div className="flex justify-between items-center text-[9px] text-[#99998f] font-bold uppercase tracking-wider mb-1">
+                      <span>🎒 General Storage Slots</span>
+                      {isInventoryUnlocked ? (
+                        <span className="text-emerald-500 font-bold text-[8px] bg-emerald-500/10 px-1 py-0.5 rounded border border-emerald-500/20">BACKPACK ACTIVE</span>
+                      ) : (
+                        <span className="text-red-500 font-bold text-[8px] bg-red-500/10 px-1 py-0.5 rounded border border-red-500/20">LOCKED (BACKPACK MINING REQUIRED)</span>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-5 gap-1.5">
+                      {inventorySlots.map((item, idx) => {
+                        const isSelected = selectedInventoryIndex === idx;
+                        const hasChalk = item && item.type === "chalk";
+                        
+                        if (!isInventoryUnlocked) {
+                          return (
+                            <div 
+                              key={`slot-locked-${idx}`}
+                              className="aspect-square border border-dashed border-red-950 bg-red-950/10 rounded flex flex-col items-center justify-center text-[10px] text-red-500/50 cursor-not-allowed select-none relative"
+                              title="Locked. Find and retrieve a canvas backpack to unlock 5 general slots."
+                            >
+                              <span>🔒</span>
+                            </div>
+                          );
+                        }
+
+                        return (
+                          <button
+                            key={`slot-${idx}`}
+                            onClick={() => {
+                              if (item) {
+                                setSelectedInventoryIndex(isSelected ? null : idx);
+                              }
+                            }}
+                            className={`aspect-square border rounded flex flex-col items-center justify-center p-1 relative transition-all duration-150 ${
+                              item 
+                                ? isSelected 
+                                  ? "border-red-500 bg-red-950/30 text-white shadow-inner scale-[1.03] ring-1 ring-red-500" 
+                                  : "border-[#4a4a40] bg-[#1a1a19] hover:bg-[#252523] text-[#eaeae0]" 
+                                : "border-dashed border-stone-800 bg-[#0c0c0b] text-[#55554e] cursor-default"
+                            }`}
+                          >
+                            {item ? (
+                              <>
+                                <span className="text-md select-none">{hasChalk ? "🖍️" : "📦"}</span>
+                                <span className="text-[7.5px] scale-90 origin-bottom font-mono text-[#fbbf24] mt-0.5 font-bold tracking-tighter truncate max-w-full">
+                                  {hasChalk ? `${item.uses}u` : "ITEM"}
+                                </span>
+                                {hasChalk && (
+                                  <div className="absolute bottom-0.5 left-1 right-1 h-0.5 bg-stone-800 rounded-full overflow-hidden">
+                                    <div 
+                                      className="h-full bg-red-500" 
+                                      style={{ width: `${(item.uses / item.maxUses) * 100}%` }} 
+                                    />
+                                  </div>
+                                )}
+                              </>
+                            ) : (
+                              <span className="text-[7px] text-stone-700 tracking-wider">EMPTY</span>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* 3. Chalk Symbols selector (Only displayed if red chalk selected) */}
+                  {selectedInventoryIndex !== null && inventorySlots[selectedInventoryIndex]?.type === "chalk" && (
+                    <div className="bg-[#1a1a19] border border-red-950/45 p-2.5 rounded-lg space-y-2 animate-fade-in">
+                      <div className="flex justify-between items-center">
+                        <span className="text-[9.5px] font-bold text-red-500 tracking-wider uppercase">🖍️ Wall Decal Symbols (Select)</span>
+                        <span className="text-[8px] text-stone-500 font-mono">25 uses/mark</span>
+                      </div>
+                      
+                      <div className="grid grid-cols-5 gap-1">
+                        {(["left-arrow", "right-arrow", "triangle", "star", "tree"] as const).map((sym) => {
+                          const isSymSelected = selectedChalkSymbol === sym;
+                          let label = "▲";
+                          if (sym === "left-arrow") label = "◀";
+                          if (sym === "right-arrow") label = "▶";
+                          if (sym === "triangle") label = "▲";
+                          if (sym === "star") label = "★";
+                          if (sym === "tree") label = "🌲";
+
+                          return (
+                            <button
+                              key={`sym-${sym}`}
+                              onClick={() => setSelectedChalkSymbol(sym)}
+                              className={`py-1.5 text-xs rounded border transition-all ${
+                                isSymSelected 
+                                  ? "border-red-500 bg-red-950/50 text-red-400 font-bold scale-105" 
+                                  : "border-[#3e3e3b] bg-[#222221] hover:bg-[#2b2b2a] text-stone-400"
+                              }`}
+                              title={sym.toUpperCase().replace("-", " ")}
+                            >
+                              {label}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      <div className="text-[8px] text-[#abab9e] text-center leading-relaxed mt-1 opacity-75">
+                        Walk up close to any collidable wall surface (&lt; 4 ft) in 3D look-mode and <span className="text-yellow-400 font-bold">LEFT-CLICK</span> to draw the selected mark.
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
               <canvas 
                 id="viewport-canvas"
                 ref={canvasRef}
                 width={520}
                 height={320}
                 onClick={(e) => {
-                  // Request mouse lock when canvas is clicked in 3D
+                  // Check if player is holding red chalk first!
+                  const activeIndex = selectedInventoryIndexRef.current;
+                  const activeSlots = inventorySlotsRef.current;
+                  const activeChalk = activeIndex !== null ? activeSlots[activeIndex] : null;
+
+                  if (viewMode === "3D" && activeChalk && activeChalk.type === "chalk" && activeChalk.uses > 0) {
+                    const canvas = canvasRef.current;
+                    if (canvas) {
+                      const rect = canvas.getBoundingClientRect();
+                      // Calculate horizontal click ratio [0, 1] across the physical canvas
+                      let clickX = canvas.width / 2;
+                      if (mousePosRef.current) {
+                        clickX = mousePosRef.current.x;
+                      } else {
+                        const clickXRaw = e.clientX - rect.left;
+                        clickX = (clickXRaw / rect.width) * canvas.width;
+                      }
+
+                      const colRatio = clickX / canvas.width;
+                      const FOV = Math.PI / 3.0; // 60 deg fov
+                      const rayAngle = playerAngleRef.current - FOV / 2.0 + colRatio * FOV;
+
+                      let rx = playerXRef.current;
+                      let rz = playerZRef.current;
+                      let dist = 0;
+                      const rayStep = 0.05;
+                      const maxDrawDist = 4.0; // 4 feet drawing radius
+                      let collided = false;
+                      let hitTileX = 0;
+                      let hitTileZ = 0;
+
+                      const sinA = Math.sin(rayAngle);
+                      const cosA = Math.cos(rayAngle);
+
+                      while (dist < maxDrawDist) {
+                        rx += cosA * rayStep;
+                        rz += sinA * rayStep;
+                        dist += rayStep;
+
+                        const testTileX = Math.floor(rx);
+                        const testTileZ = Math.floor(rz);
+
+                        const check = getTileClassification(testTileX, testTileZ, seed);
+                        if (check.solid) {
+                          collided = true;
+                          hitTileX = testTileX;
+                          hitTileZ = testTileZ;
+                          break;
+                        }
+                      }
+
+                      if (collided) {
+                        // Deduct chalk uses
+                        const updatedSlots = [...activeSlots];
+                        const chalkTarget = { ...activeChalk };
+                        chalkTarget.uses -= 1;
+                        
+                        if (chalkTarget.uses <= 0) {
+                          updatedSlots[activeIndex!] = null;
+                          setSelectedInventoryIndex(null);
+                        } else {
+                          updatedSlots[activeIndex!] = chalkTarget;
+                        }
+                        setInventorySlots(updatedSlots);
+
+                        // Friction sound
+                        try {
+                          const ctx = getAudioContext();
+                          if (ctx && ctx.state !== "suspended") {
+                            const osc = ctx.createOscillator();
+                            const gain = ctx.createGain();
+                            osc.type = "sine";
+                            osc.frequency.setValueAtTime(650, ctx.currentTime);
+                            osc.frequency.exponentialRampToValueAtTime(120, ctx.currentTime + 0.12);
+                            gain.gain.setValueAtTime(0.04, ctx.currentTime);
+                            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.12);
+                            osc.connect(gain);
+                            gain.connect(ctx.destination);
+                            osc.start();
+                            osc.stop(ctx.currentTime + 0.13);
+                          }
+                        } catch (err) {}
+
+                        // Calculate tile boundary face and u placement offset
+                        const cellFracX = rx - hitTileX;
+                        const cellFracZ = rz - hitTileZ;
+                        const dL = cellFracX;
+                        const dR = 1 - cellFracX;
+                        const dT = cellFracZ;
+                        const dB = 1 - cellFracZ;
+                        const minE = Math.min(dL, dR, dT, dB);
+                        
+                        let hitFace: "north" | "south" | "east" | "west" = "north";
+                        let uVal = 0.5;
+
+                        if (minE === dL) {
+                          hitFace = "west";
+                          uVal = cellFracZ;
+                        } else if (minE === dR) {
+                          hitFace = "east";
+                          uVal = 1 - cellFracZ;
+                        } else if (minE === dT) {
+                          hitFace = "north";
+                          uVal = 1 - cellFracX;
+                        } else {
+                          hitFace = "south";
+                          uVal = cellFracX;
+                        }
+
+                        const newDrawing: ChalkDrawing = {
+                          id: `drawing-${hitTileX}-${hitTileZ}-${hitFace}-${Date.now()}`,
+                          tileX: hitTileX,
+                          tileZ: hitTileZ,
+                          face: hitFace,
+                          symbol: selectedChalkSymbolRef.current,
+                          u: uVal
+                        };
+                        
+                        setChalkDrawings((prev) => [...prev, newDrawing]);
+                        return; // Done drawing, prevent locking
+                      }
+                    }
+                  }
+
+                  // Fallback: request mouse lock when canvas is clicked in 3D
                   if (viewMode === "3D" && document.pointerLockElement !== canvasRef.current) {
-                    canvasRef.current?.requestPointerLock();
+                    const timeElapsed = Date.now() - lastPtrExitTimeRef.current;
+                    if (timeElapsed < 1500) {
+                      setShowCooldownWarning(true);
+                      setTimeout(() => setShowCooldownWarning(false), 1500);
+                      return;
+                    }
+
+                    try {
+                      const promise = canvasRef.current?.requestPointerLock();
+                      if (promise && typeof promise.catch === "function") {
+                        promise.catch((err) => {
+                          console.warn("Pointer lock request rejected by browser:", err);
+                        });
+                      }
+                    } catch (err) {
+                      console.warn("Pointer lock request sync exception:", err);
+                    }
                     return;
                   }
                   
@@ -2002,6 +2880,27 @@ export default function App() {
             {/* Directional Pad Controls Panel (Perfect for touch/mouse users) */}
             <div className="bg-[#1b1b1a] p-4 border-t border-[#2e2e2b] flex flex-col md:flex-row justify-between items-center gap-4" id="view-controls">
               
+              {/* Inventory toggle button for touch & keyboard users */}
+              <button
+                id="inventory-toggle-btn"
+                onClick={() => {
+                  setIsInventoryOpen((prev) => {
+                    const next = !prev;
+                    if (next && document.pointerLockElement === canvasRef.current) {
+                      document.exitPointerLock();
+                    }
+                    return next;
+                  });
+                }}
+                className={`w-full md:w-auto px-4 py-2 border font-mono text-xs font-bold rounded-lg transition-all flex items-center justify-center gap-2 active:scale-95 whitespace-nowrap cursor-pointer ${
+                  isInventoryOpen 
+                    ? "bg-yellow-550/20 text-yellow-400 border-yellow-500/40" 
+                    : "bg-[#242422] text-[#eaeae0] border-[#3e3e3b] hover:bg-yellow-500/10 hover:border-yellow-500/20"
+                }`}
+              >
+                🎒 {isInventoryOpen ? "CLOSE INVENTORY" : "VIEW INVENTORY (I)"}
+              </button>
+
               {/* Movement Speed controls */}
               <div className="flex items-center gap-3 w-full md:w-auto" id="speed-slider-group">
                 <label className="text-xs text-[#a2a299] font-mono select-none" htmlFor="speed-slider">Speed: {speed} ft/s</label>
@@ -2026,7 +2925,12 @@ export default function App() {
                   <button 
                     id="pad-up"
                     onClick={() => handleKeyPad("forward")}
-                    className="bg-[#242422] border border-[#3e3e3b] text-[#eaeae0] rounded hover:bg-yellow-500/20 hover:border-yellow-500/40 font-mono font-bold text-xs flex items-center justify-center p-2 active:scale-95"
+                    onTouchStart={(e) => { e.preventDefault(); handleTouchStartStr("forward"); }}
+                    onTouchEnd={(e) => { e.preventDefault(); handleTouchEndStr("forward"); }}
+                    onMouseDown={() => handleTouchStartStr("forward")}
+                    onMouseUp={() => handleTouchEndStr("forward")}
+                    onMouseLeave={() => handleTouchEndStr("forward")}
+                    className="bg-[#242422] border border-[#3e3e3b] text-[#eaeae0] rounded hover:bg-yellow-500/20 hover:border-yellow-500/40 font-mono font-bold text-xs flex items-center justify-center p-2 active:scale-95 touch-none"
                   >
                     ▲
                   </button>
@@ -2034,21 +2938,36 @@ export default function App() {
                   <button 
                     id="pad-left"
                     onClick={() => handleKeyPad("left")}
-                    className="bg-[#242422] border border-[#3e3e3b] text-[#eaeae0] rounded hover:bg-yellow-500/20 hover:border-yellow-500/40 font-mono font-bold text-xs flex items-center justify-center p-2 active:scale-95"
+                    onTouchStart={(e) => { e.preventDefault(); handleTouchStartStr("left"); }}
+                    onTouchEnd={(e) => { e.preventDefault(); handleTouchEndStr("left"); }}
+                    onMouseDown={() => handleTouchStartStr("left")}
+                    onMouseUp={() => handleTouchEndStr("left")}
+                    onMouseLeave={() => handleTouchEndStr("left")}
+                    className="bg-[#242422] border border-[#3e3e3b] text-[#eaeae0] rounded hover:bg-yellow-500/20 hover:border-yellow-500/40 font-mono font-bold text-xs flex items-center justify-center p-2 active:scale-95 touch-none"
                   >
                     ◀
                   </button>
                   <button 
                     id="pad-down"
                     onClick={() => handleKeyPad("backward")}
-                    className="bg-[#242422] border border-[#3e3e3b] text-[#eaeae0] rounded hover:bg-yellow-500/20 hover:border-yellow-500/40 font-mono font-bold text-xs flex items-center justify-center p-2 active:scale-95"
+                    onTouchStart={(e) => { e.preventDefault(); handleTouchStartStr("backward"); }}
+                    onTouchEnd={(e) => { e.preventDefault(); handleTouchEndStr("backward"); }}
+                    onMouseDown={() => handleTouchStartStr("backward")}
+                    onMouseUp={() => handleTouchEndStr("backward")}
+                    onMouseLeave={() => handleTouchEndStr("backward")}
+                    className="bg-[#242422] border border-[#3e3e3b] text-[#eaeae0] rounded hover:bg-yellow-500/20 hover:border-yellow-500/40 font-mono font-bold text-xs flex items-center justify-center p-2 active:scale-95 touch-none"
                   >
                     ▼
                   </button>
                   <button 
                     id="pad-right"
                     onClick={() => handleKeyPad("right")}
-                    className="bg-[#242422] border border-[#3e3e3b] text-[#eaeae0] rounded hover:bg-yellow-500/20 hover:border-yellow-500/40 font-mono font-bold text-xs flex items-center justify-center p-2 active:scale-95"
+                    onTouchStart={(e) => { e.preventDefault(); handleTouchStartStr("right"); }}
+                    onTouchEnd={(e) => { e.preventDefault(); handleTouchEndStr("right"); }}
+                    onMouseDown={() => handleTouchStartStr("right")}
+                    onMouseUp={() => handleTouchEndStr("right")}
+                    onMouseLeave={() => handleTouchEndStr("right")}
+                    className="bg-[#242422] border border-[#3e3e3b] text-[#eaeae0] rounded hover:bg-yellow-500/20 hover:border-yellow-500/40 font-mono font-bold text-xs flex items-center justify-center p-2 active:scale-95 touch-none"
                   >
                     ▶
                   </button>
@@ -2114,48 +3033,81 @@ export default function App() {
               </div>
             </div>
           </div>
+
+          {/* EMERGENCY PROCEDURES: ANOMALOUS CHASM EXITS MANUAL */}
+          <div className="bg-[#141413] border border-dashed border-yellow-600/30 rounded-xl p-4 flex flex-col gap-3 shadow-lg" id="tutorial-card">
+            <div className="flex items-center gap-2 text-xs font-mono tracking-wider font-bold text-yellow-500 uppercase select-none">
+              <Compass className="w-4 h-4 text-yellow-500 animate-spin-slow shrink-0" />
+              <span>EMERGENCY OUTLET PROTOCOL GUIDE</span>
+            </div>
+            <div className="font-mono text-[11px] text-[#abab9e] space-y-2 leading-relaxed">
+              <p>
+                Procedural algorithms map boundaries deterministically across infinite sectors. Some partition segments warp under cryptographic stress, converting standard walls into walked anomalies. 
+              </p>
+              <div className="border border-[#2d2d2a] bg-[#0c0c0b] p-3 rounded-lg space-y-2 text-[11px]">
+                <p className="font-semibold text-yellow-400">🔍 HOW TO DETECT & INTERACTION STEPS:</p>
+                <ul className="list-decimal list-inside space-y-1.5 text-[#9a9a8f]">
+                  <li>
+                    Every wall tile coordinate undergoes a spatial hash step: <code className="text-[#ecd073]">val = hash % 300</code>.
+                  </li>
+                  <li>
+                    If <code className="text-[#ecd073]">val === 15</code>, a <code className="text-yellow-500 font-bold">D20 validation dice</code> is cast.
+                  </li>
+                  <li>
+                    A result of <code className="text-yellow-500 font-semibold">15 to 20</code> (30% chance) morphs the wall into an <strong className="text-yellow-400">"import os" anomaly</strong>.
+                  </li>
+                  <li>
+                    Exactly <strong className="text-emerald-400 font-bold">1-in-3 anomalies</strong> is configured as a real walkable noclip exit! 
+                  </li>
+                </ul>
+              </div>
+              <p className="text-[10px] text-[#8e8e82]">
+                💡 <span className="text-emerald-400 font-semibold">3D Gaze Analysis:</span> Approach anomalies inside the Retro 3D view. Real outlets leak <span className="text-emerald-400 font-bold">pulsing neon-green matrix scanlines</span> indicating walkable space. Fake anomalies emit <span className="text-cyan-400 font-semibold">static cyan scanlines</span> and remain physically solid.
+              </p>
+            </div>
+          </div>
         </section>
 
         {/* RIGHT COLUMN: CODE CENTER & LORE HUB */}
         <section className="lg:col-span-5 flex flex-col gap-4" id="code-section">
           
           {/* TABS SWITCHER */}
-          <div className="flex gap-2 bg-[#141413] p-1 rounded-xl border border-[#2e2e2b]" id="right-column-tabber">
+          <div className="flex gap-2 bg-[#141413] p-1.5 rounded-2xl border border-[#2e2e2b] mb-1" id="right-column-tabber">
             <button
               id="right-panel-tab-code"
               onClick={() => setRightPanelTab("code")}
-              className={`flex-1 py-1.5 rounded-lg text-xs font-mono font-bold tracking-wider uppercase transition-all flex items-center justify-center gap-1.5 ${
+              className={`flex-1 py-3 px-3 rounded-xl text-xs font-mono font-semibold tracking-wide uppercase transition-all flex items-center justify-center gap-2 border ${
                 rightPanelTab === "code" 
-                  ? "bg-yellow-500/20 text-yellow-400 border border-yellow-500/35" 
-                  : "text-[#a2a299] hover:text-[#eaeae0]"
+                  ? "bg-yellow-500/15 text-yellow-400 border-yellow-500/30 shadow-md" 
+                  : "text-[#a2a299] hover:text-[#eaeae0] border-transparent hover:bg-[#1a1a19]"
               }`}
             >
-              <FileText className="w-3.5 h-3.5" />
-              Code
+              <FileText className="w-4 h-4" />
+              <span>Source Code</span>
             </button>
             <button
               id="right-panel-tab-lore"
               onClick={() => setRightPanelTab("lore")}
-              className={`flex-1 py-1.5 rounded-lg text-xs font-mono font-bold tracking-wider uppercase transition-all flex items-center justify-center gap-1.5 ${
+              className={`flex-1 py-3 px-3 rounded-xl text-xs font-mono font-semibold tracking-wide uppercase transition-all flex items-center justify-center gap-2 border ${
                 rightPanelTab === "lore" 
-                  ? "bg-yellow-500/20 text-yellow-500 border border-yellow-500/35" 
-                  : "text-[#a2a299] hover:text-[#eaeae0]"
+                  ? "bg-yellow-500/15 text-yellow-500 border-yellow-500/30 shadow-md" 
+                  : "text-[#a2a299] hover:text-[#eaeae0] border-transparent hover:bg-[#1a1a19]"
               }`}
             >
-              <Briefcase className="w-3.5 h-3.5" />
-              Logbook ({collectedBackpacks.length})
+              <Briefcase className="w-4 h-4" />
+              <span>Logbook ({collectedBackpacks.length})</span>
             </button>
             <button
               id="right-panel-tab-dev"
               onClick={() => setRightPanelTab("dev")}
-              className={`flex-1 py-1.5 rounded-lg text-xs font-mono font-bold tracking-wider uppercase transition-all flex items-center justify-center gap-1.5 ${
+              className={`flex-1 py-3 px-3 rounded-xl text-xs font-mono font-semibold tracking-wide uppercase transition-all flex items-center justify-center gap-2 border ${
                 rightPanelTab === "dev" 
-                  ? "bg-red-500/20 text-red-400 border border-red-500/35" 
-                  : "text-[#a2a299] hover:text-[#eaeae0]"
+                  ? "bg-red-500/15 text-red-400 border-red-500/35 shadow-md" 
+                  : "text-[#a2a299] hover:text-[#eaeae0] border-transparent hover:bg-[#1a1a19]"
               }`}
             >
-              <Settings className="w-3.5 h-3.5" />
-              Dev Portal
+              <Settings className="w-4 h-4" />
+              <span>Dev Portal</span>
             </button>
           </div>
 
@@ -2587,7 +3539,7 @@ export default function App() {
                   IMPORT OS SUCCESSFUL: SYS_ESCAPE_TRIGGERED
                 </span>
               </div>
-              <span>PORT: 3000 / OS_SHELL</span>
+              <span>OS_SUBSYSTEM_ENV_SHELL</span>
             </div>
 
             {/* Code / execution visualization */}
@@ -2619,35 +3571,35 @@ else:
               </div>
 
               <div id="escape-success-text" className="space-y-4 leading-relaxed">
-                <p className="text-sm font-bold text-emerald-400 select-none uppercase tracking-wide">
+                <p className="text-base font-bold text-emerald-400 select-none uppercase tracking-wide">
                   &gt;&gt; STAGE_STATUS: OUTSIDE THE MATRIX
                 </p>
                 
                 {collectedBackpacks.length < 15 ? (
-                  <div className="space-y-3">
-                    <p className="text-xs font-bold text-[#f59e0b] select-none animate-pulse uppercase">
+                  <div className="space-y-4">
+                    <p className="text-sm font-bold text-[#f59e0b] select-none animate-pulse uppercase tracking-wider">
                       [OPTIONAL OBJECTIVE: PRESERVE ARCHIVES - UNRESOLVED]
                     </p>
-                    <p className="text-xs text-[#c5c5bb]">
+                    <p className="text-sm text-[#cacac0] leading-relaxed">
                       You successfully noclip-escaped through the <strong className="text-emerald-400 font-bold">1 in 3 anomaly portal</strong>! 
                     </p>
-                    <p className="text-xs text-[#fca5a5] border border-red-950 bg-[#150a0a] p-3 rounded-lg leading-relaxed">
-                      ⚠ <strong>Note</strong>: You escaped, but you didn't care for the past. Unlocking the "import os" interface allowed you to step outside the backrooms constraints, but you left the personal diaries of those who came before to dissolve in the moist yellow carpet. You retrieved only <span className="font-bold text-white">{collectedBackpacks.length} / 15 diaries</span>.
+                    <p className="text-sm text-[#fca5a5] border border-red-950 bg-[#150a0a] p-4 rounded-xl leading-relaxed">
+                      ⚠ <strong>Note</strong>: You escaped, but you didn't care for the past. Unlocking the "import os" interface allowed you to step outside the backrooms' procedural constraints, but you left the personal diaries of those who came before to dissolve in the moist yellow carpet. You retrieved only <span className="font-bold text-white">{collectedBackpacks.length} / 15 diaries</span>.
                     </p>
                     <p className="text-xs text-[#a2a299]">
                       Reset the seed to try again if you wish to fulfill the optional objective of gathering at least 15 logs before crossing over.
                     </p>
                   </div>
                 ) : (
-                  <div className="space-y-3">
-                    <p className="text-xs font-bold text-emerald-400 select-none animate-pulse uppercase">
+                  <div className="space-y-4">
+                    <p className="text-sm font-bold text-emerald-400 select-none animate-pulse uppercase tracking-wider">
                       [OPTIONAL OBJECTIVE: PRESERVE ARCHIVES - COMPLETED ✅]
                     </p>
-                    <p className="text-xs text-[#c5c5bb]">
+                    <p className="text-sm text-[#cacac0] leading-relaxed">
                       You successfully noclip-escaped through the <strong className="text-emerald-400 font-bold">1 in 3 anomaly portal</strong>!
                     </p>
-                    <p className="text-xs text-[#a7f3d0] border border-emerald-950 bg-[#09150e] p-3 rounded-lg leading-relaxed">
-                      🎉 <strong>Honored Legacy</strong>: You cared for the past! You traversed the sector bounds and carried all <span className="font-bold text-white">{collectedBackpacks.length} lost personal archives</span> safely past the boundary gates. Their stories survive forever through you.
+                    <p className="text-sm text-[#a7f3d0] border border-emerald-950 bg-[#09150e] p-4 rounded-xl leading-relaxed">
+                      🎉 <strong>Honored Legacy</strong>: You cared for the past! You traversed the infinite sector bounds and carried all <span className="font-bold text-white">{collectedBackpacks.length} lost personal archives</span> safely past the boundary gates. Their stories survive forever through you.
                     </p>
                     <p className="text-xs text-[#a2a299]">
                       Physical coordinates have fully collapsed. The Python subprocess interpreter is ready for seed replacement.
@@ -2673,7 +3625,39 @@ else:
               
               <button
                 id="continue-explore-btn"
-                onClick={() => setHasEscaped(false)}
+                onClick={() => {
+                  setHasEscaped(false);
+                  
+                  // Apply a physical retro knock back of 3 tiles (3 feet) opposite to the player's current view angle
+                  const currentAngle = playerAngleRef.current;
+                  const knockbackDistance = 3.0; // 3 feet/tiles
+                  
+                  const targetX = playerXRef.current - Math.cos(currentAngle) * knockbackDistance;
+                  const targetZ = playerZRef.current - Math.sin(currentAngle) * knockbackDistance;
+                  
+                  // Make sure the player lands securely within walkable tiles and doesn't get pushed into a solid block
+                  const resolvedPos = resolveCollisions(targetX, targetZ, 0.4, seed);
+                  playerXRef.current = resolvedPos.x;
+                  playerZRef.current = resolvedPos.z;
+
+                  // Synthesize a retro physical knockback sound to emphasize the physical force of the anomaly
+                  try {
+                    const ctx = getAudioContext();
+                    if (ctx && ctx.state !== "suspended") {
+                      const osc = ctx.createOscillator();
+                      const gain = ctx.createGain();
+                      osc.type = "triangle";
+                      osc.frequency.setValueAtTime(120, ctx.currentTime);
+                      osc.frequency.exponentialRampToValueAtTime(30, ctx.currentTime + 0.4);
+                      gain.gain.setValueAtTime(0.2, ctx.currentTime);
+                      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+                      osc.connect(gain);
+                      gain.connect(ctx.destination);
+                      osc.start();
+                      osc.stop(ctx.currentTime + 0.41);
+                    }
+                  } catch (err) {}
+                }}
                 className="w-full sm:w-auto bg-[#242422] hover:bg-[#2d2d2a] text-emerald-400 border border-emerald-950/50 px-6 py-3 rounded-lg text-xs font-mono transition-all hover:scale-[1.03] active:scale-[0.97] text-center"
               >
                 Keep Exploring Anomaly Area
